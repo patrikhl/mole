@@ -273,6 +273,9 @@ func start(app *cli.App) error {
 		return err
 	}
 
+	//TODO move the attribute assignment below to a tunnel configuration object (they are not optional)
+	t.ConnectionRetries = app.ConnectionRetries
+	t.WaitAndRetry = app.WaitAndRetry
 	t.KeepAliveInterval = app.KeepAliveInterval
 
 	if err = t.Start(); err != nil {

@@ -107,12 +107,6 @@ type SSHChannel struct {
 	conn     net.Conn
 }
 
-func (ch *SSHChannel) Close() {
-	if ch.listener != nil {
-		ch.listener.Close()
-	}
-}
-
 func (ch SSHChannel) String() string {
 	return fmt.Sprintf("[local=%s, remote=%s]", ch.Local, ch.Remote)
 }
@@ -122,14 +116,26 @@ func (ch SSHChannel) String() string {
 type Tunnel struct {
 	// Ready tells when the Tunnel is ready to accept connections
 	Ready chan bool
+
 	// KeepAliveInterval is the time period used to send keep alive packets to
 	// the remote ssh server
 	KeepAliveInterval time.Duration
 
-	server   *Server
-	channels []*SSHChannel
-	done     chan error
-	client   *ssh.Client
+	// ConnectionRetries is the number os attempts to reconnect to the ssh server
+	// when the current connection fails
+	ConnectionRetries int
+
+	// WaitAndRetry is the time waited before trying to reconnect to the ssh
+	// server
+	WaitAndRetry time.Duration
+
+	server        *Server
+	channels      []*SSHChannel
+	done          chan error
+	client        *ssh.Client
+	stopKeepAlive chan bool //TODO rename to keepAlive and ignore messages with value true (which would mean start keep alive)
+	reconnect     chan error
+	watchConn     chan bool
 }
 
 // New creates a new instance of Tunnel.
@@ -142,85 +148,46 @@ func New(server *Server, channels []*SSHChannel) (*Tunnel, error) {
 	}
 
 	return &Tunnel{
-		Ready:    make(chan bool, 1),
-		channels: channels,
-		server:   server,
-		done:     make(chan error),
+		Ready:         make(chan bool, 1),
+		channels:      channels,
+		server:        server,
+		reconnect:     make(chan error, 1),
+		done:          make(chan error, 1),
+		stopKeepAlive: make(chan bool, 1),
+		watchConn:     make(chan bool, 1),
 	}, nil
 }
 
 // Start creates the ssh tunnel and initialized all channels allowing data
 // exchange between local and remote enpoints.
 func (t *Tunnel) Start() error {
-	err := t.Listen()
-	if err != nil {
-		return err
-	}
-	defer func() {
-		for _, ch := range t.channels {
-			ch.Close()
-		}
-	}()
-
 	log.Debugf("tunnel: %s", t)
 
-	//connecting to ssh server
-	err = t.dial()
-	if err != nil {
-		return err
-	}
+	t.connect()
 
-	wg := &sync.WaitGroup{}
-	wg.Add(len(t.channels))
+	for {
+		select {
+		case err := <-t.reconnect:
+			if err != nil {
+				log.WithError(err).Warnf("connection to ssh server got interrupted")
 
-	// wait for all ssh channels to be ready to accept connections then sends a
-	// single message signalling all tunnel are ready
-	go func(tunnel *Tunnel, waitgroup *sync.WaitGroup) {
-		waitgroup.Wait()
-		tunnel.Ready <- true
-	}(t, wg)
+				t.stopKeepAlive <- true
+				t.watchConn <- false
+				t.client.Close()
 
-	for _, ch := range t.channels {
-		go func(channel *SSHChannel, waitgroup *sync.WaitGroup) {
-			var err error
-			var once sync.Once
+				log.Debugf("restablishing the tunnel after disconnection: %s", t)
 
-			for {
-
-				once.Do(func() {
-					log.WithFields(log.Fields{
-						"local":  channel.Local,
-						"remote": channel.Remote,
-					}).Info("tunnel is ready")
-
-					waitgroup.Done()
-				})
-
-				channel.conn, err = channel.listener.Accept()
-				if err != nil {
-					t.done <- fmt.Errorf("error while establishing new connection: %v", err)
-					return
-				}
-
-				log.WithFields(log.Fields{
-					"address": channel.conn.RemoteAddr(),
-				}).Debug("new connection")
-
-				err = t.startChannel(channel)
-				if err != nil {
-					t.done <- err
-					return
-				}
+				t.connect()
 			}
-		}(ch, wg)
-	}
+		case err := <-t.done:
+			if t.client != nil {
+				t.stopKeepAlive <- true
+				t.watchConn <- false
+				t.client.Close()
+			}
 
-	select {
-	case err = <-t.done:
-		if t.client != nil {
-			t.client.Conn.Close()
+			return err
 		}
-		return err
 	}
 }
 
@@ -242,8 +209,19 @@ func (t *Tunnel) Listen() error {
 }
 
 func (t *Tunnel) startChannel(channel *SSHChannel) error {
+	var err error
+
+	channel.conn, err = channel.listener.Accept()
+	if err != nil {
+		return fmt.Errorf("error while establishing local connection: %v", err)
+	}
+
+	log.WithFields(log.Fields{
+		"channel": channel,
+	}).Debug("local connection established")
+
 	if t.client == nil {
-		return fmt.Errorf("new channel can't be established: missing connection to the ssh server")
+		return fmt.Errorf("tunnel channel can't be established: missing connection to the ssh server")
 	}
 
 	remoteConn, err := t.client.Dial("tcp", channel.Remote)
@@ -255,9 +233,9 @@ func (t *Tunnel) startChannel(channel *SSHChannel) error {
 	go copyConn(remoteConn, channel.conn)
 
 	log.WithFields(log.Fields{
-		"remote": channel.Remote,
-		"server": t.server,
-	}).Debug("new connection established to remote")
+		"channel": channel,
+		"server":  t.server,
+	}).Debug("tunnel channel has been established")
 
 	return nil
 }
@@ -274,7 +252,7 @@ func (t Tunnel) String() string {
 
 func (t *Tunnel) dial() error {
 	if t.client != nil {
-		return nil
+		t.client.Close()
 	}
 
 	c, err := sshClientConfig(*t.server)
@@ -282,22 +260,123 @@ func (t *Tunnel) dial() error {
 		return fmt.Errorf("error generating ssh client config: %s", err)
 	}
 
-	t.client, err = ssh.Dial("tcp", t.server.Address, c)
-	if err != nil {
-		return fmt.Errorf("server dial error: %s", err)
+	retries := 0
+	for {
+		if t.ConnectionRetries > 0 && retries == t.ConnectionRetries {
+			log.WithFields(log.Fields{
+				"server":  t.server,
+				"retries": retries,
+			}).Error("maximum number of connection retries to the ssh server reached")
+
+			return fmt.Errorf("error while connection to ssh server")
+		}
+
+		t.client, err = ssh.Dial("tcp", t.server.Address, c)
+		if err != nil {
+			log.WithError(err).WithFields(log.Fields{
+				"server":  t.server,
+				"retries": retries,
+			}).Debugf("error while connecting to ssh server")
+
+			if t.ConnectionRetries < 0 {
+				break
+			}
+
+			retries = retries + 1
+
+			time.Sleep(t.WaitAndRetry)
+			continue
+		}
+
+		break
 	}
 
 	go t.keepAlive()
 
+	if t.ConnectionRetries > 0 {
+		go t.watchForDisconnect()
+	}
+
 	log.WithFields(log.Fields{
 		"server": t.server,
-	}).Debug("new connection established to server")
+	}).Debug("connection to the ssh server is established")
 
 	return nil
 }
 
+func (t *Tunnel) watchForDisconnect() {
+	wc := make(chan error, 1)
+
+	go func() {
+		wc <- t.client.Wait()
+	}()
+
+	for {
+		select {
+		case c := <-t.watchConn:
+			if !c {
+				return
+			}
+		case err := <-wc:
+			t.reconnect <- err
+			return
+		}
+	}
+}
+
+func (t *Tunnel) connect() {
+	err := t.Listen()
+	if err != nil {
+		t.done <- err
+		return
+	}
+
+	err = t.dial()
+	if err != nil {
+		t.reconnect <- err
+		return
+	}
+
+	wg := &sync.WaitGroup{}
+	wg.Add(len(t.channels))
+
+	// wait for all ssh channels to be ready to accept connections then sends a
+	// single message signalling all tunnels are ready
+	go func(tunnel *Tunnel, waitgroup *sync.WaitGroup) {
+		waitgroup.Wait()
+		t.Ready <- true
+	}(t, wg)
+
+	for _, ch := range t.channels {
+		go func(channel *SSHChannel, waitgroup *sync.WaitGroup) {
+			var err error
+			var once sync.Once
+
+			for {
+				once.Do(func() {
+					log.WithFields(log.Fields{
+						"local":  channel.Local,
+						"remote": channel.Remote,
+					}).Info("tunnel channel is waiting for connection")
+
+					waitgroup.Done()
+				})
+
+				err = t.startChannel(channel)
+				if err != nil {
+					t.done <- err
+					return
+				}
+			}
+		}(ch, wg)
+	}
+
+}
+
 func (t *Tunnel) keepAlive() {
 	ticker := time.NewTicker(t.KeepAliveInterval)
+
+	log.Debug("start sending keep alive packets")
 
 	for {
 		select {
@@ -306,6 +385,9 @@ func (t *Tunnel) keepAlive() {
 			if err != nil {
 				log.Warnf("error sending keep-alive request to ssh server: %v", err)
 			}
+		case <-t.stopKeepAlive:
+			log.Debug("stop sending keep alive packets")
+			return
 		}
 	}
 }
